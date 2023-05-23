@@ -1,0 +1,3 @@
+[submodule "solana"]
+	path = solana
+	url = https://github.com/0xNineteen/solana.git
