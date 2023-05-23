@@ -7,6 +7,7 @@ use solana_transaction_status::{EncodedTransaction, UiTransactionEncoding, UiCon
 use solana_account_decoder::{self, UiAccountData, parse_stake::{parse_stake, StakeAccountType}, parse_vote::parse_vote};
 use solana_entry::entry::{Entry, EntrySlice};
 use solana_sdk::hash::Hash;
+use solana_sdk::hash::hashv;
 
 #[macro_export]
 macro_rules! send_rpc_call {
@@ -57,9 +58,9 @@ async fn get_block(slot: u64, endpoint: String) -> GetBlockResponse {
 }
 
 async fn parse_block_votes() { 
-    // let endpoint = "http://127.0.0.1:8002";
+    let endpoint = "http://127.0.0.1:8002";
 
-    let endpoint = "https://rpc.helius.xyz/?api-key=cee342ba-0773-41f7-a6e0-9ff01fff124b";
+    // let endpoint = "https://rpc.helius.xyz/?api-key=cee342ba-0773-41f7-a6e0-9ff01fff124b";
     let vote_program_id = "Vote111111111111111111111111111111111111111".to_string();
     let vote_program_id = Pubkey::from_str(&vote_program_id).unwrap();
 
@@ -73,65 +74,69 @@ async fn parse_block_votes() {
     let total_stake = leader_stakes.iter().fold(0, |sum, i| sum + *i.1);
 
     // let slot = 354;
-    let slot = 194458133;
-    let resp = get_block(slot, endpoint.to_string()).await;
-    let block = resp.result;
+    for i in 0..40 {
+        let slot = 1640 + i;
+        println!("slot {:?}", slot);
 
-    // // doesnt support new version txs 
-    // let block = client.get_block(slot).unwrap();
-    // println!("{:#?}", block);
-
-    if block.transactions.is_none() { 
-        println!("no transactions");
-        return;
-    }
-
-    for tx in block.transactions.unwrap().iter() {
-        let tx = &tx.transaction;
-        let tx = match tx { 
-            EncodedTransaction::Binary(tx, enc) => {
-                assert!(*enc == TransactionBinaryEncoding::Base58);
-                let tx = bs58::decode(tx).into_vec().unwrap();
-                let tx: VersionedTransaction = bincode::deserialize(&tx[..]).unwrap();
-                tx
-            }
-            _ => panic!("ahh")
-        };
-
-        let msg = tx.message;
-        if !msg.static_account_keys().contains(&vote_program_id) { 
-            println!("tx doesnt include vote program ...");
-            continue;
+        let resp = get_block(slot, endpoint.to_string()).await;
+        let block = resp.result;
+    
+        // // doesnt support new version txs 
+        // let block = client.get_block(slot).unwrap();
+        // println!("{:#?}", block);
+    
+        if block.transactions.is_none() { 
+            println!("no transactions");
+            return;
         }
-
-        let ix = msg.instructions().get(0).unwrap();
-        let data = &ix.data;
-        let vote_ix: VoteInstruction = bincode::deserialize(&data[..]).unwrap();
-        let slot_vote = vote_ix.last_voted_slot().unwrap_or_default();
-        let bank_hash = match &vote_ix { 
-            VoteInstruction::Vote(v) => Some(v.hash),   
-            VoteInstruction::CompactUpdateVoteState(v) => Some(v.hash),
-            _ => None
-        };
-
-        println!("{:?}", vote_ix);
-        println!("voted for slot {:?} with bank_hash {:?}", slot_vote, bank_hash);
-
-        let node_pubkey = msg.static_account_keys().get(0).unwrap().to_string();
-        let stake_amount = leader_stakes.get(&node_pubkey).unwrap();
-        println!("{:?} {:?}", node_pubkey, stake_amount);
-
-        // verify the signature
-        let msg_bytes = msg.serialize();
-        let sig_verifies: Vec<_> = tx.signatures
-            .iter()
-            .zip(msg.static_account_keys().iter())
-            .map(|(signature, pubkey)| signature.verify(pubkey.as_ref(), &msg_bytes[..]))
-            .collect();
-
-        println!("{:?}", sig_verifies);
-
-        break;
+    
+        for tx in block.transactions.unwrap().iter() {
+            let tx = &tx.transaction;
+            let tx = match tx { 
+                EncodedTransaction::Binary(tx, enc) => {
+                    assert!(*enc == TransactionBinaryEncoding::Base58);
+                    let tx = bs58::decode(tx).into_vec().unwrap();
+                    let tx: VersionedTransaction = bincode::deserialize(&tx[..]).unwrap();
+                    tx
+                }
+                _ => panic!("ahh")
+            };
+    
+            let msg = tx.message;
+            if !msg.static_account_keys().contains(&vote_program_id) { 
+                println!("tx doesnt include vote program ...");
+                continue;
+            }
+    
+            let ix = msg.instructions().get(0).unwrap();
+            let data = &ix.data;
+            let vote_ix: VoteInstruction = bincode::deserialize(&data[..]).unwrap();
+            let slot_vote = vote_ix.last_voted_slot().unwrap_or_default();
+            let bank_hash = match &vote_ix { 
+                VoteInstruction::Vote(v) => Some(v.hash),   
+                VoteInstruction::CompactUpdateVoteState(v) => Some(v.hash),
+                _ => None
+            };
+    
+            // println!("{:?}", vote_ix);
+            println!("voted for slot {:?} with bank_hash {:?}", slot_vote, bank_hash);
+    
+            let node_pubkey = msg.static_account_keys().get(0).unwrap().to_string();
+            let stake_amount = leader_stakes.get(&node_pubkey).unwrap();
+            // println!("{:?} {:?}", node_pubkey, stake_amount);
+    
+            // verify the signature
+            let msg_bytes = msg.serialize();
+            let sig_verifies: Vec<_> = tx.signatures
+                .iter()
+                .zip(msg.static_account_keys().iter())
+                .map(|(signature, pubkey)| signature.verify(pubkey.as_ref(), &msg_bytes[..]))
+                .collect();
+    
+            println!("{:?}", sig_verifies);
+    
+            // break;
+        }
     }
 }
 
@@ -198,9 +203,9 @@ pub async fn verify_slot() {
 
     // rn you just gotta run a python script to send a tx - get sig and get slot its located in 
     let tx_sig = Signature::from_str(
-        "61njgFyzWfhawzqtZeAeTBMcPmWDb2WMEfCz8i98EaA4Nj9AzFpfEzTyRx7wPR4MGdbLN7qmzk9Jq7NZKYnrbVu9"
+        "5iKR4t1sUmNnVVZTuiA1eRSjhibZE4BUAVpEBJhmFqWg64GjRhLMVpmpt5SWjnAkuRetXt28KLcyTGt4Zw6S8hck"
     ).unwrap();
-    let slot = 942;
+    let slot = 1640;
 
     // let slot = client.get_slot().unwrap();
     println!("verifying slot {:?}", slot);
@@ -229,12 +234,21 @@ pub async fn verify_slot() {
     }
     println!("tx in entry: {:?}", tx_entry);
 
+    // recompute the bank hash 
+    let hash = hashv(&[
+        block_headers.parent_hash.as_ref(),
+        block_headers.accounts_delta_hash.as_ref(),
+        block_headers.signature_count_buf.as_ref(), 
+        last_blockhash.as_ref()
+    ]);
+    println!("bank hash: {:?}", hash);
+
 }
 
 #[tokio::main]
 async fn main() {
-    // parse_block_votes().await;
-    verify_slot().await;
+    parse_block_votes().await;
+    // verify_slot().await;
 
     // let endpoint = "http://127.0.0.1:8002";
 
