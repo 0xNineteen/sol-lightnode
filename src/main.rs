@@ -154,8 +154,13 @@ async fn get_block_headers(slot: u64, endpoint: String) -> GetBlockHeadersRespon
         ]
     }).to_string();
     let resp = send_rpc_call!(endpoint, request);
-    let resp = serde_json::from_str::<GetBlockHeadersResponse>(&resp).unwrap();
-    resp
+    let parsed_resp = serde_json::from_str::<GetBlockHeadersResponse>(&resp);
+    if parsed_resp.is_err() { 
+        println!("ERR: {:?}", resp);
+    }
+    let parsed_resp = parsed_resp.unwrap();
+
+    parsed_resp
 }
 
 pub fn read_keypair_file<F: AsRef<Path>>(path: F) -> Keypair {
@@ -179,17 +184,23 @@ pub async fn verify_slot() {
     let balance = client.get_balance(&random.pubkey()).unwrap();
     println!("random keypair balance: {:?}", balance);
 
-    // todo: fix this
-    let ix = system_instruction::transfer(
-        &keypair.pubkey(), 
-        &random.pubkey(), 
-        10000
-    );
-    let recent_blockhash = client.get_latest_blockhash().expect("Failed to get latest blockhash.");
-    let tx = Transaction::new_signed_with_payer(&[ix], Some(&keypair.pubkey()), &[&keypair], recent_blockhash);
-    let tx_sig = client.send_transaction(&tx).unwrap();
-    let tx_info = client.get_transaction(&tx_sig, UiTransactionEncoding::Json).unwrap();
-    let slot = tx_info.slot;
+    // // todo: fix this
+    // let ix = system_instruction::transfer(
+    //     &keypair.pubkey(), 
+    //     &random.pubkey(), 
+    //     10000
+    // );
+    // let recent_blockhash = client.get_latest_blockhash().expect("Failed to get latest blockhash.");
+    // let tx = Transaction::new_signed_with_payer(&[ix], Some(&keypair.pubkey()), &[&keypair], recent_blockhash);
+    // let tx_sig = client.send_transaction(&tx).unwrap();
+    // let tx_info = client.get_transaction(&tx_sig, UiTransactionEncoding::Json).unwrap();
+    // let slot = tx_info.slot;
+
+    // rn you just gotta run a python script to send a tx - get sig and get slot its located in 
+    let tx_sig = Signature::from_str(
+        "61njgFyzWfhawzqtZeAeTBMcPmWDb2WMEfCz8i98EaA4Nj9AzFpfEzTyRx7wPR4MGdbLN7qmzk9Jq7NZKYnrbVu9"
+    ).unwrap();
+    let slot = 942;
 
     // let slot = client.get_slot().unwrap();
     println!("verifying slot {:?}", slot);
