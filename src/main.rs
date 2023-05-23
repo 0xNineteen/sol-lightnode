@@ -1,8 +1,8 @@
-use std::{str::FromStr, collections::HashMap};
+use std::{str::FromStr, collections::HashMap, path::Path, fs::File, io::Read};
 
 use serde::{Serialize, Deserialize};
-use solana_client::rpc_client::RpcClient;
-use solana_sdk::{vote::{instruction::VoteInstruction, self}, signature::Signature, transaction::{VersionedTransaction, SanitizedTransaction}, pubkey::Pubkey};
+use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
+use solana_sdk::{vote::{instruction::VoteInstruction, self}, signature::{Signature, Keypair}, transaction::{VersionedTransaction, SanitizedTransaction, Transaction}, pubkey::Pubkey, signer::Signer, system_instruction::{transfer, self}};
 use solana_transaction_status::{EncodedTransaction, UiTransactionEncoding, UiConfirmedBlock, EncodedConfirmedBlock, TransactionBinaryEncoding, BlockHeader};
 use solana_account_decoder::{self, UiAccountData, parse_stake::{parse_stake, StakeAccountType}, parse_vote::parse_vote};
 use solana_entry::entry::{Entry, EntrySlice};
@@ -158,25 +158,65 @@ async fn get_block_headers(slot: u64, endpoint: String) -> GetBlockHeadersRespon
     resp
 }
 
+pub fn read_keypair_file<F: AsRef<Path>>(path: F) -> Keypair {
+    let mut file = File::open(path.as_ref()).unwrap();
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).unwrap();
+    let bytes: Vec<u8> = serde_json::from_str(&buf).unwrap();
+    Keypair::from_bytes(&bytes[..]).unwrap()
+}
+
 pub async fn verify_slot() { 
     let endpoint = "http://127.0.0.1:8002";
-
     let client = RpcClient::new(endpoint);
 
-    let slot = client.get_slot().unwrap();
+    let path = "./solana/validator/ledger/node1/validator_id.json";
+    let keypair = read_keypair_file(path);
+    let balance = client.get_balance(&keypair.pubkey()).unwrap();
+    println!("keypair balance: {:?}", balance);
+
+    let random = Keypair::new();
+    let balance = client.get_balance(&random.pubkey()).unwrap();
+    println!("random keypair balance: {:?}", balance);
+
+    // todo: fix this
+    let ix = system_instruction::transfer(
+        &keypair.pubkey(), 
+        &random.pubkey(), 
+        10000
+    );
+    let recent_blockhash = client.get_latest_blockhash().expect("Failed to get latest blockhash.");
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&keypair.pubkey()), &[&keypair], recent_blockhash);
+    let tx_sig = client.send_transaction(&tx).unwrap();
+    let tx_info = client.get_transaction(&tx_sig, UiTransactionEncoding::Json).unwrap();
+    let slot = tx_info.slot;
+
+    // let slot = client.get_slot().unwrap();
     println!("verifying slot {:?}", slot);
 
     let block_headers = get_block_headers(slot, endpoint.to_string()).await.result;
     let block_headers: BlockHeader = bincode::deserialize(&block_headers).unwrap();
-
     let entries = block_headers.entries; 
     let last_blockhash = block_headers.last_blockhash;
+
+    // verify the entries are valid PoH ticks / path 
     let verified = entries.verify(&last_blockhash);
     if !verified { 
         println!("entry verification failed ...");
         return;
     }
     println!("entry verification passed!");
+
+    // find tx signature in entry
+    let mut tx_entry = None;
+    for entry in entries { 
+        for tx in entry.transactions { 
+            if tx.signatures.contains(&tx_sig) {
+                tx_entry = Some(tx);
+            }
+        }
+    }
+    println!("tx in entry: {:?}", tx_entry);
 
 }
 
