@@ -5,7 +5,7 @@ use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig}
 use solana_sdk::{vote::{instruction::VoteInstruction, self}, signature::{Signature, Keypair}, transaction::{VersionedTransaction, SanitizedTransaction, Transaction}, pubkey::Pubkey, signer::Signer, system_instruction::{transfer, self}, commitment_config::CommitmentConfig};
 use solana_transaction_status::{EncodedTransaction, UiTransactionEncoding, UiConfirmedBlock, EncodedConfirmedBlock, TransactionBinaryEncoding, BlockHeader, EncodedConfirmedTransactionWithStatusMeta};
 use solana_account_decoder::{self, UiAccountData, parse_stake::{parse_stake, StakeAccountType}, parse_vote::parse_vote};
-use solana_entry::entry::{Entry, EntrySlice};
+use solana_entry::entry::{Entry, EntrySlice, hash_transactions, next_hash};
 use solana_sdk::hash::Hash;
 use solana_sdk::hash::hashv;
 
@@ -191,11 +191,11 @@ async fn get_tx(signtaure: Signature, endpoint: String) -> GetTransactionRespons
         }).to_string();
         let resp = send_rpc_call!(&endpoint, request);
         let parsed_resp = serde_json::from_str::<GetTransactionResponse>(&resp);
-        if parsed_resp.is_err() { 
+        if parsed_resp.is_err() {  // tx is not available yet
             print!(".");
             sleep(Duration::from_millis(500));
             continue;
-        }  
+        }
         tx_resp = Some(parsed_resp.unwrap());
         break;
     }
@@ -242,10 +242,11 @@ pub async fn verify_slot() {
     // get headers
     let block_headers = get_block_headers(slot, endpoint.to_string()).await.result;
     let block_headers: BlockHeader = bincode::deserialize(&block_headers).unwrap();
-    let entries = block_headers.entries; 
-    let start_blockhash = block_headers.last_blockhash;
 
     // verify the entries are valid PoH ticks / path 
+    let entries = block_headers.entries; 
+    let start_blockhash = block_headers.start_blockhash;
+
     let verified = entries.verify(&start_blockhash);
     if !verified { 
         println!("entry verification failed ...");
@@ -254,16 +255,26 @@ pub async fn verify_slot() {
     println!("entry verification passed!");
     let last_blockhash = entries.last().unwrap().hash;
 
-    // find tx signature in entry
-    let mut tx_entry = None;
-    for entry in entries { 
-        for tx in entry.transactions { 
-            if tx.signatures.contains(&tx_sig) {
-                tx_entry = Some(tx);
+    // find and verify tx signature in entry
+    let mut start_hash = &last_blockhash;
+    for entry in entries.iter() {
+        let tx_is_in = entry.transactions.iter().any(|tx| { 
+            tx.signatures.contains(&tx_sig)
+        });
+        if tx_is_in { 
+            let hash = next_hash(start_hash, entry.num_hashes, &entry.transactions);
+            let entry_hash = entry.hash;
+            if hash != entry_hash {
+                println!("tx entry verification failed...");
+                println!("hash mismatch: {:?} != {:?}", hash, entry_hash);
+                return; // early exit
+            } else { 
+                println!("tx entry verification passed!");
             }
+            break;
         }
+        start_hash = &entry.hash;
     }
-    println!("tx in entry: {:?}", tx_entry);
 
     // recompute the bank hash 
     let hash = hashv(&[
@@ -277,8 +288,8 @@ pub async fn verify_slot() {
 
 #[tokio::main]
 async fn main() {
-    parse_block_votes().await;
-    // verify_slot().await;
+    // parse_block_votes().await;
+    verify_slot().await;
 
     // let endpoint = "http://127.0.0.1:8002";
 
