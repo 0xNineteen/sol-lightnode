@@ -1,9 +1,9 @@
-use std::{str::FromStr, collections::HashMap, path::Path, fs::File, io::Read};
+use std::{str::FromStr, collections::HashMap, path::Path, fs::File, io::Read, thread::sleep, time::Duration};
 
 use serde::{Serialize, Deserialize};
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
-use solana_sdk::{vote::{instruction::VoteInstruction, self}, signature::{Signature, Keypair}, transaction::{VersionedTransaction, SanitizedTransaction, Transaction}, pubkey::Pubkey, signer::Signer, system_instruction::{transfer, self}};
-use solana_transaction_status::{EncodedTransaction, UiTransactionEncoding, UiConfirmedBlock, EncodedConfirmedBlock, TransactionBinaryEncoding, BlockHeader};
+use solana_sdk::{vote::{instruction::VoteInstruction, self}, signature::{Signature, Keypair}, transaction::{VersionedTransaction, SanitizedTransaction, Transaction}, pubkey::Pubkey, signer::Signer, system_instruction::{transfer, self}, commitment_config::CommitmentConfig};
+use solana_transaction_status::{EncodedTransaction, UiTransactionEncoding, UiConfirmedBlock, EncodedConfirmedBlock, TransactionBinaryEncoding, BlockHeader, EncodedConfirmedTransactionWithStatusMeta};
 use solana_account_decoder::{self, UiAccountData, parse_stake::{parse_stake, StakeAccountType}, parse_vote::parse_vote};
 use solana_entry::entry::{Entry, EntrySlice};
 use solana_sdk::hash::Hash;
@@ -73,7 +73,6 @@ async fn parse_block_votes() {
         .collect::<HashMap<_, _>>();
     let total_stake = leader_stakes.iter().fold(0, |sum, i| sum + *i.1);
 
-    // let slot = 354;
     for i in 0..40 {
         let slot = 1640 + i;
         println!("slot {:?}", slot);
@@ -168,6 +167,43 @@ async fn get_block_headers(slot: u64, endpoint: String) -> GetBlockHeadersRespon
     parsed_resp
 }
 
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTransactionResponse {
+    pub jsonrpc: String,
+    pub result: EncodedConfirmedTransactionWithStatusMeta,
+    pub id: i64,
+}
+
+async fn get_tx(signtaure: Signature, endpoint: String) -> GetTransactionResponse { 
+    let mut tx_resp = None;
+
+    loop { 
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTransaction",
+            "params": [signtaure.to_string(),
+            {
+                "commitment": "confirmed",
+                "encoding": "json",
+            }]
+        }).to_string();
+        let resp = send_rpc_call!(&endpoint, request);
+        let parsed_resp = serde_json::from_str::<GetTransactionResponse>(&resp);
+        if parsed_resp.is_err() { 
+            print!(".");
+            sleep(Duration::from_millis(500));
+            continue;
+        }  
+        tx_resp = Some(parsed_resp.unwrap());
+        break;
+    }
+    print!("\n");
+
+    tx_resp.unwrap()
+}
+
 pub fn read_keypair_file<F: AsRef<Path>>(path: F) -> Keypair {
     let mut file = File::open(path.as_ref()).unwrap();
     let mut buf = String::new();
@@ -185,31 +221,25 @@ pub async fn verify_slot() {
     let balance = client.get_balance(&keypair.pubkey()).unwrap();
     println!("keypair balance: {:?}", balance);
 
-    let random = Keypair::new();
+    let path = "./solana/validator/ledger/rando_keys/1.json";
+    let random = read_keypair_file(path);
     let balance = client.get_balance(&random.pubkey()).unwrap();
     println!("random keypair balance: {:?}", balance);
 
-    // // todo: fix this
-    // let ix = system_instruction::transfer(
-    //     &keypair.pubkey(), 
-    //     &random.pubkey(), 
-    //     10000
-    // );
-    // let recent_blockhash = client.get_latest_blockhash().expect("Failed to get latest blockhash.");
-    // let tx = Transaction::new_signed_with_payer(&[ix], Some(&keypair.pubkey()), &[&keypair], recent_blockhash);
-    // let tx_sig = client.send_transaction(&tx).unwrap();
-    // let tx_info = client.get_transaction(&tx_sig, UiTransactionEncoding::Json).unwrap();
-    // let slot = tx_info.slot;
-
-    // rn you just gotta run a python script to send a tx - get sig and get slot its located in 
-    let tx_sig = Signature::from_str(
-        "5iKR4t1sUmNnVVZTuiA1eRSjhibZE4BUAVpEBJhmFqWg64GjRhLMVpmpt5SWjnAkuRetXt28KLcyTGt4Zw6S8hck"
-    ).unwrap();
-    let slot = 1640;
-
-    // let slot = client.get_slot().unwrap();
+    // simple tx to verify
+    let ix = system_instruction::transfer(
+        &keypair.pubkey(), 
+        &random.pubkey(), 
+        100
+    );
+    let recent_blockhash = client.get_latest_blockhash().expect("Failed to get latest blockhash.");
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&keypair.pubkey()), &[&keypair], recent_blockhash);
+    let tx_sig = client.send_transaction(&tx).unwrap();
+    let tx_info = get_tx(tx_sig, endpoint.to_string()).await; 
+    let slot = tx_info.result.slot;
     println!("verifying slot {:?}", slot);
 
+    // get headers
     let block_headers = get_block_headers(slot, endpoint.to_string()).await.result;
     let block_headers: BlockHeader = bincode::deserialize(&block_headers).unwrap();
     let entries = block_headers.entries; 
@@ -243,7 +273,6 @@ pub async fn verify_slot() {
         last_blockhash.as_ref()
     ]);
     println!("bank hash: {:?}", hash);
-
 }
 
 #[tokio::main]
