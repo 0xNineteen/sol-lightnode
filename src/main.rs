@@ -1,4 +1,4 @@
-use std::{str::FromStr, collections::HashMap, path::Path, fs::File, io::Read, thread::sleep, time::Duration};
+use std::{str::FromStr, collections::HashMap, path::Path, fs::File, io::{Read, Write}, thread::sleep, time::Duration};
 
 use serde::{Serialize, Deserialize};
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
@@ -38,55 +38,62 @@ pub struct GetBlockResponse {
     pub id: i64,
 }
 
+async fn get_block(slot: u64, endpoint: &String) -> GetBlockResponse { 
+    let mut block_resp = None;
+    loop { 
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBlock",
+            "params":[
+                slot,
+                { 
+                    "encoding": "base58", // better for deserialzing
+                    "maxSupportedTransactionVersion": 0,
+                }
+            ]
+        }).to_string();
+        let resp = send_rpc_call!(endpoint, request);
+        let parsed_resp = serde_json::from_str::<GetBlockResponse>(&resp);
+        if parsed_resp.is_err() {  // block is not available yet
+            print!(".");
+            std::io::stdout().flush().unwrap();
+            sleep(Duration::from_millis(500));
+            continue;
+        }
+        block_resp = Some(parsed_resp.unwrap());
+        break;
+    }
 
-async fn get_block(slot: u64, endpoint: String) -> GetBlockResponse { 
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getBlock",
-        "params":[
-            slot,
-            { 
-                "encoding": "base58", // better for deserialzing
-                "maxSupportedTransactionVersion": 0,
-            }
-        ]
-    }).to_string();
-    let resp = send_rpc_call!(endpoint, request);
-    let resp = serde_json::from_str::<GetBlockResponse>(&resp).unwrap();
-    resp
+    block_resp.unwrap()
 }
 
-async fn parse_block_votes() { 
-    let endpoint = "http://127.0.0.1:8002";
-
+async fn parse_block_votes(target_slot: u64, slots_ahead: u64, endpoint: String) -> Option<(u64, HashMap<Hash, u64>)> {
     // let endpoint = "https://rpc.helius.xyz/?api-key=cee342ba-0773-41f7-a6e0-9ff01fff124b";
     let vote_program_id = "Vote111111111111111111111111111111111111111".to_string();
     let vote_program_id = Pubkey::from_str(&vote_program_id).unwrap();
 
-    let client = RpcClient::new(endpoint);
+    let client = RpcClient::new(endpoint.clone());
     let vote_accounts = client.get_vote_accounts().unwrap();
     let leader_stakes = vote_accounts.current
         .iter()
         .chain(vote_accounts.delinquent.iter())
         .map(|x| (x.node_pubkey.clone(), x.activated_stake))
         .collect::<HashMap<_, _>>();
-    let total_stake = leader_stakes.iter().fold(0, |sum, i| sum + *i.1);
+    let total_stake = leader_stakes.values().sum::<u64>();
 
-    for i in 0..40 {
-        let slot = 1640 + i;
-        println!("slot {:?}", slot);
+    let mut votes = HashMap::new();
 
-        let resp = get_block(slot, endpoint.to_string()).await;
+    for i in 0..slots_ahead {
+        let slot = target_slot + i;
+
+        println!("requesting block @ slot {}", slot);
+        let resp = get_block(slot, &endpoint).await;
         let block = resp.result;
-    
-        // // doesnt support new version txs 
-        // let block = client.get_block(slot).unwrap();
-        // println!("{:#?}", block);
     
         if block.transactions.is_none() { 
             println!("no transactions");
-            return;
+            return None;
         }
     
         for tx in block.transactions.unwrap().iter() {
@@ -103,40 +110,45 @@ async fn parse_block_votes() {
     
             let msg = tx.message;
             if !msg.static_account_keys().contains(&vote_program_id) { 
-                println!("tx doesnt include vote program ...");
+                // println!("tx doesnt include vote program ...");
                 continue;
             }
     
             let ix = msg.instructions().get(0).unwrap();
             let data = &ix.data;
             let vote_ix: VoteInstruction = bincode::deserialize(&data[..]).unwrap();
-            let slot_vote = vote_ix.last_voted_slot().unwrap_or_default();
             let bank_hash = match &vote_ix { 
                 VoteInstruction::Vote(v) => Some(v.hash),   
                 VoteInstruction::CompactUpdateVoteState(v) => Some(v.hash),
                 _ => None
             };
-    
+            if bank_hash.is_none() { continue; }
+            let bank_hash = bank_hash.unwrap();
+
+            // let slot_vote = vote_ix.last_voted_slot().unwrap_or_default();
             // println!("{:?}", vote_ix);
-            println!("voted for slot {:?} with bank_hash {:?}", slot_vote, bank_hash);
-    
-            let node_pubkey = msg.static_account_keys().get(0).unwrap().to_string();
-            let stake_amount = leader_stakes.get(&node_pubkey).unwrap();
+            // println!("voted for slot {:?} with bank_hash {:?}", slot_vote, bank_hash);
             // println!("{:?} {:?}", node_pubkey, stake_amount);
     
             // verify the signature
             let msg_bytes = msg.serialize();
-            let sig_verifies: Vec<_> = tx.signatures
+            let sig_verifies = tx.signatures
                 .iter()
                 .zip(msg.static_account_keys().iter())
                 .map(|(signature, pubkey)| signature.verify(pubkey.as_ref(), &msg_bytes[..]))
-                .collect();
-    
-            println!("{:?}", sig_verifies);
-    
-            // break;
+                .all(|x| x);
+
+            if sig_verifies { 
+                let node_pubkey = msg.static_account_keys().get(0).unwrap().to_string();
+                let stake_amount = leader_stakes.get(&node_pubkey).unwrap();
+
+                let entry = votes.entry(bank_hash).or_insert(0);
+                *entry += stake_amount; 
+            }
         }
     }
+
+    Some((total_stake, votes))
 }
 
 
@@ -246,17 +258,15 @@ pub async fn verify_slot() {
     // verify the entries are valid PoH ticks / path 
     let entries = block_headers.entries; 
     let start_blockhash = block_headers.start_blockhash;
-
     let verified = entries.verify(&start_blockhash);
     if !verified { 
         println!("entry verification failed ...");
         return;
     }
     println!("entry verification passed!");
-    let last_blockhash = entries.last().unwrap().hash;
 
     // find and verify tx signature in entry
-    let mut start_hash = &last_blockhash;
+    let mut start_hash = &start_blockhash;
     for entry in entries.iter() {
         let tx_is_in = entry.transactions.iter().any(|tx| { 
             tx.signatures.contains(&tx_sig)
@@ -277,69 +287,31 @@ pub async fn verify_slot() {
     }
 
     // recompute the bank hash 
-    let hash = hashv(&[
+    let last_blockhash = entries.last().unwrap().hash;
+    let bankhash = hashv(&[
         block_headers.parent_hash.as_ref(),
         block_headers.accounts_delta_hash.as_ref(),
         block_headers.signature_count_buf.as_ref(), 
         last_blockhash.as_ref()
     ]);
-    println!("bank hash: {:?}", hash);
+    println!("bank hash: {:?}", bankhash);
+
+    println!("parsing votes from block ...");
+    let vote_result = parse_block_votes(slot, 5, endpoint.to_string()).await;
+    if vote_result.is_none() { 
+        println!("vote verification failed ...");
+    }
+    let (total_stake, votes) = vote_result.unwrap();
+    let bankhash_vote_stakes = votes.get(&bankhash).unwrap();
+    println!("bankhash vote stakes: {:?} total stakes: {total_stake:?}", bankhash_vote_stakes);
+
+    // bankhash_vote_stakes >= 2/3 * total_stake
+    // 3 * bankhash_vote_stakes >= 2 * total_stake
+    let is_supermajority = 3 * bankhash_vote_stakes >= 2 * total_stake;
+    println!("bankhash has supermajority of votes: {:?}", is_supermajority);
 }
 
 #[tokio::main]
 async fn main() {
-    // parse_block_votes().await;
     verify_slot().await;
-
-    // let endpoint = "http://127.0.0.1:8002";
-
-    // // // GPA on stake times out here
-    // // let endpoint = "https://rpc.helius.xyz/?api-key=cee342ba-0773-41f7-a6e0-9ff01fff124b";
-    // let client = RpcClient::new(endpoint);
-
-    // let vote_accounts = client.get_vote_accounts().unwrap();
-    // let leader_stakes = vote_accounts.current
-    //     .iter()
-    //     .chain(vote_accounts.delinquent.iter())
-    //     .map(|x| (x.node_pubkey.clone(), x.activated_stake))
-    //     .collect::<HashMap<_, _>>();
-    // println!("{:?}", leader_stakes);
-
-    // println!("---");
-    // let stake_program = Pubkey::from_str("Stake11111111111111111111111111111111111111").unwrap();
-    // let stake_accounts = client.get_program_accounts(&stake_program).unwrap();
-    // for (pubkey, account) in stake_accounts.iter() { 
-    //     let stake = parse_stake(account.data.as_slice()).unwrap();
-    //     match stake {
-    //         StakeAccountType::Initialized(stake) => println!("{:?}", stake),
-    //         StakeAccountType::Delegated(stake) => println!("{:?}", stake),
-    //         _ => {}
-    //     }
-    // }
-
-    // println!("---");
-    // let vote_program = Pubkey::from_str("Vote111111111111111111111111111111111111111").unwrap();
-    // let vote_accounts = client.get_program_accounts(&vote_program).unwrap();
-    // for (_, account) in vote_accounts.iter() { 
-    //     let vote = parse_vote(account.data.as_slice()).unwrap();
-    //     println!("{:?}", vote);
-    // }
-    
-    // println!("---");
-    // let leader_schedule = client.get_leader_schedule(None).unwrap().unwrap();
-    // println!("{:?}", leader_schedule);
-
-    // let slot = 194458133;
-    // let leader_schedule = client.get_leader_schedule(Some(slot)).unwrap().unwrap();
-    // let leaders = leader_schedule.iter().map(|(pubkey, _)| Pubkey::from_str(pubkey).unwrap()).collect::<Vec<_>>();
-    // let stakes = leaders.iter().map(|leader| { 
-    //     // todo: get stake account pubkey
-    //     let stake = client.get_stake_activation(*leader, None).unwrap();
-    //     let stake_amount = stake.active;
-    //     stake_amount
-    // });
-
-    // let leader_stakes = leaders.iter().zip(stakes).collect::<HashMap<_, _>>();
-    // println!("{:#?}", leader_stakes);
-
 }
