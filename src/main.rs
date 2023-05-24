@@ -213,15 +213,16 @@ pub async fn verify_slot() {
     let block_headers = get_block_headers(slot, endpoint.to_string()).await.result;
     let block_headers: BlockHeader = bincode::deserialize(&block_headers).unwrap();
     let entries = block_headers.entries; 
-    let last_blockhash = block_headers.last_blockhash;
+    let start_blockhash = block_headers.last_blockhash;
 
     // verify the entries are valid PoH ticks / path 
-    let verified = entries.verify(&last_blockhash);
+    let verified = entries.verify(&start_blockhash);
     if !verified { 
         println!("entry verification failed ...");
         return;
     }
     println!("entry verification passed!");
+    let last_blockhash = entries.last().unwrap().hash;
 
     // find tx signature in entry
     let mut tx_entry = None;
