@@ -3,9 +3,9 @@ use std::{str::FromStr, collections::HashMap, path::Path, fs::File, io::{Read, W
 use serde::{Serialize, Deserialize};
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_sdk::{vote::{instruction::VoteInstruction, self}, signature::{Signature, Keypair}, transaction::{VersionedTransaction, SanitizedTransaction, Transaction}, pubkey::Pubkey, signer::Signer, system_instruction::{transfer, self}, commitment_config::CommitmentConfig};
-use solana_transaction_status::{EncodedTransaction, UiTransactionEncoding, UiConfirmedBlock, EncodedConfirmedBlock, TransactionBinaryEncoding, BlockHeader, EncodedConfirmedTransactionWithStatusMeta};
+use solana_transaction_status::{EncodedTransaction, UiTransactionEncoding, UiConfirmedBlock, EncodedConfirmedBlock, TransactionBinaryEncoding, BlockHeader, EncodedConfirmedTransactionWithStatusMeta, EntryProof, PartialEntry};
 use solana_account_decoder::{self, UiAccountData, parse_stake::{parse_stake, StakeAccountType}, parse_vote::parse_vote};
-use solana_entry::entry::{Entry, EntrySlice, hash_transactions, next_hash};
+use solana_entry::{entry::{Entry, EntrySlice, hash_transactions, next_hash}, poh::Poh};
 use solana_sdk::hash::Hash;
 use solana_sdk::hash::hashv;
 
@@ -160,13 +160,14 @@ pub struct GetBlockHeadersResponse {
     pub id: i64,
 }
 
-async fn get_block_headers(slot: u64, endpoint: String) -> GetBlockHeadersResponse { 
+async fn get_block_headers(slot: u64, signature: Signature, endpoint: String) -> GetBlockHeadersResponse { 
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getBlockHeaders",
         "params":[
-            slot
+            slot, 
+            signature.as_ref(),
         ]
     }).to_string();
     let resp = send_rpc_call!(endpoint, request);
@@ -190,7 +191,7 @@ pub struct GetTransactionResponse {
 async fn get_tx(signtaure: Signature, endpoint: String) -> GetTransactionResponse { 
     let mut tx_resp = None;
 
-    loop { 
+    while tx_resp.is_none() { 
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -208,12 +209,30 @@ async fn get_tx(signtaure: Signature, endpoint: String) -> GetTransactionRespons
             sleep(Duration::from_millis(500));
             continue;
         }
+
         tx_resp = Some(parsed_resp.unwrap());
-        break;
     }
     print!("\n");
 
     tx_resp.unwrap()
+}
+
+pub fn next_hash_with_tx_hash(
+    start_hash: &Hash,
+    num_hashes: u64,
+    transaction_hash: Option<Hash>,
+) -> Hash {
+    if num_hashes == 0 && transaction_hash.is_none() {
+        return *start_hash;
+    }
+
+    let mut poh = Poh::new(*start_hash, None);
+    poh.hash(num_hashes.saturating_sub(1));
+    if transaction_hash.is_none() {
+        poh.tick().unwrap().hash
+    } else {
+        poh.record(transaction_hash.unwrap()).unwrap().hash
+    }
 }
 
 pub fn read_keypair_file<F: AsRef<Path>>(path: F) -> Keypair {
@@ -252,42 +271,63 @@ pub async fn verify_slot() {
     println!("verifying slot {:?}", slot);
 
     // get headers
-    let block_headers = get_block_headers(slot, endpoint.to_string()).await.result;
+    let block_headers = get_block_headers(slot, tx_sig, endpoint.to_string()).await.result;
     let block_headers: BlockHeader = bincode::deserialize(&block_headers).unwrap();
+    let entries = block_headers.entries; 
+
+    // find and verify tx signature in entry
+    let mut tx_found = false;
+    for entry in entries.iter() {
+        match entry { 
+            EntryProof::FullEntry(x) => {
+                let tx_is_in = x.transactions.iter().any(|tx| { 
+                    tx.signatures.contains(&tx_sig)
+                });
+                if !tx_is_in {
+                    println!("tx signature not found in FullEntry...");
+                    return;
+                }
+                tx_found = true;
+                println!("tx signature found!");
+                break;
+            }, 
+            _ => {}
+        };
+    }
+    if !tx_found { 
+        println!("tx signature not found in entries (no FullEntry) ...");
+        return;
+    }
 
     // verify the entries are valid PoH ticks / path 
-    let entries = block_headers.entries; 
     let start_blockhash = block_headers.start_blockhash;
-    let verified = entries.verify(&start_blockhash);
+    let genesis = [EntryProof::PartialEntry(PartialEntry {
+        num_hashes: 0,
+        hash: start_blockhash,
+        transaction_hash: None
+    })];
+
+    let mut entry_pairs = genesis.iter().chain(entries.iter()).zip(entries.iter());
+    let verified = entry_pairs.all(|(x0, x1)| {
+            let start_hash = x0.hash();
+            let r = match x1 { 
+                EntryProof::PartialEntry(x) => {
+                    x.hash == next_hash_with_tx_hash(&start_hash, x.num_hashes, x.transaction_hash)
+                }, 
+                EntryProof::FullEntry(x) => {
+                    x.hash == next_hash(&start_hash, x.num_hashes, &x.transactions)
+                }
+            };
+            r
+        });
     if !verified { 
         println!("entry verification failed ...");
         return;
     }
     println!("entry verification passed!");
 
-    // find and verify tx signature in entry
-    let mut start_hash = &start_blockhash;
-    for entry in entries.iter() {
-        let tx_is_in = entry.transactions.iter().any(|tx| { 
-            tx.signatures.contains(&tx_sig)
-        });
-        if tx_is_in { 
-            let hash = next_hash(start_hash, entry.num_hashes, &entry.transactions);
-            let entry_hash = entry.hash;
-            if hash != entry_hash {
-                println!("tx entry verification failed...");
-                println!("hash mismatch: {:?} != {:?}", hash, entry_hash);
-                return; // early exit
-            } else { 
-                println!("tx entry verification passed!");
-            }
-            break;
-        }
-        start_hash = &entry.hash;
-    }
-
     // recompute the bank hash 
-    let last_blockhash = entries.last().unwrap().hash;
+    let last_blockhash = entries.last().unwrap().hash();
     let bankhash = hashv(&[
         block_headers.parent_hash.as_ref(),
         block_headers.accounts_delta_hash.as_ref(),
