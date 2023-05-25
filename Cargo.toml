@@ -16,3 +16,4 @@ solana-sdk =  { path = "solana/sdk" }
 solana-transaction-status =  { path = "solana/transaction-status" }
 solana-entry =  { path = "solana/entry" }
 solana-rpc =  { path = "solana/rpc" }
+solana-merkle-tree =  { path = "solana/merkle-tree" }

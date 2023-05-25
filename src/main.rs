@@ -8,6 +8,15 @@ use solana_account_decoder::{self, UiAccountData, parse_stake::{parse_stake, Sta
 use solana_entry::{entry::{Entry, EntrySlice, hash_transactions, next_hash}, poh::Poh};
 use solana_sdk::hash::Hash;
 use solana_sdk::hash::hashv;
+use solana_merkle_tree::{MerkleTree, merkle_tree::SolidProof};
+
+// from merkle-tree crate
+const LEAF_PREFIX: &[u8] = &[0];
+macro_rules! hash_leaf {
+    {$d:ident} => {
+        hashv(&[LEAF_PREFIX, $d])
+    }
+}
 
 #[macro_export]
 macro_rules! send_rpc_call {
@@ -254,7 +263,12 @@ pub async fn verify_slot() {
 
     let path = "./solana/validator/ledger/rando_keys/1.json";
     let random = read_keypair_file(path);
-    let balance = client.get_balance(&random.pubkey()).unwrap();
+    let mut balance = 0;
+    // sometimes takes a while to get the balance from airdrop
+    while balance == 0 { 
+        balance = client.get_balance(&random.pubkey()).unwrap();
+        sleep(Duration::from_millis(500));
+    }
     println!("random keypair balance: {:?}", balance);
 
     // simple tx to verify
@@ -279,23 +293,28 @@ pub async fn verify_slot() {
     let mut tx_found = false;
     for entry in entries.iter() {
         match entry { 
-            EntryProof::FullEntry(x) => {
-                let tx_is_in = x.transactions.iter().any(|tx| { 
-                    tx.signatures.contains(&tx_sig)
-                });
-                if !tx_is_in {
-                    println!("tx signature not found in FullEntry...");
+            EntryProof::MerkleEntry(x) => {
+                println!("{:?}", x);
+
+                // verify merkle proof here 
+                let leaf = tx_sig.as_ref();
+                let candidate = hash_leaf!(leaf);
+                // when len == 1 this does nothing
+                let verified = x.proof.verify(candidate);
+                if !verified { 
+                    println!("tx signature not verified!");
                     return;
                 }
+
                 tx_found = true;
-                println!("tx signature found!");
+                println!("tx signature verified!");
                 break;
             }, 
             _ => {}
         };
     }
     if !tx_found { 
-        println!("tx signature not found in entries (no FullEntry) ...");
+        println!("tx signature not found in entries...");
         return;
     }
 
@@ -306,20 +325,25 @@ pub async fn verify_slot() {
         hash: start_blockhash,
         transaction_hash: None
     })];
-
     let mut entry_pairs = genesis.iter().chain(entries.iter()).zip(entries.iter());
     let verified = entry_pairs.all(|(x0, x1)| {
-            let start_hash = x0.hash();
-            let r = match x1 { 
-                EntryProof::PartialEntry(x) => {
-                    x.hash == next_hash_with_tx_hash(&start_hash, x.num_hashes, x.transaction_hash)
-                }, 
-                EntryProof::FullEntry(x) => {
-                    x.hash == next_hash(&start_hash, x.num_hashes, &x.transactions)
-                }
-            };
-            r
-        });
+        let start_hash = x0.hash();
+        let r = match x1 { 
+            EntryProof::PartialEntry(x) => {
+                next_hash_with_tx_hash(&start_hash, x.num_hashes, x.transaction_hash) == x.hash
+            }, 
+            EntryProof::MerkleEntry(x) => {
+                let tx_hash = if let Some(hash) = x.proof.root() {
+                    hash
+                } else { 
+                    let tx_sig_ref = tx_sig.as_ref();
+                    hash_leaf!(tx_sig_ref)
+                };
+                next_hash_with_tx_hash(&start_hash, x.num_hashes, Some(tx_hash)) == x.hash
+            }
+        };
+        r
+    });
     if !verified { 
         println!("entry verification failed ...");
         return;

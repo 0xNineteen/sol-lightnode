@@ -4594,6 +4594,7 @@ version = "1.16.0"
 dependencies = [
  "fast-math",
  "matches",
+ "serde",
  "solana-program 1.16.0",
 ]
 
@@ -4908,6 +4909,7 @@ dependencies = [
  "solana-gossip",
  "solana-ledger",
  "solana-measure",
+ "solana-merkle-tree",
  "solana-metrics",
  "solana-perf",
  "solana-poh",
@@ -5351,6 +5353,7 @@ dependencies = [
  "solana-account-decoder",
  "solana-address-lookup-table-program",
  "solana-entry",
+ "solana-merkle-tree",
  "solana-sdk 1.16.0",
  "spl-associated-token-account",
  "spl-memo",
@@ -6296,6 +6299,7 @@ dependencies = [
  "solana-account-decoder",
  "solana-client",
  "solana-entry",
+ "solana-merkle-tree",
  "solana-rpc",
  "solana-sdk 1.16.0",
  "solana-transaction-status",
